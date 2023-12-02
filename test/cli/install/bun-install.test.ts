@@ -1,6 +1,6 @@
 import { file, listen, Socket, spawn } from "bun";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, describe, test } from "bun:test";
-import { bunExe, bunEnv as env } from "harness";
+import { bunExe, bunEnv as env, ignoreMimallocWarning, withoutMimalloc } from "harness";
 import { access, mkdir, readlink, realpath, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import {
@@ -20,6 +20,97 @@ beforeAll(dummyBeforeAll);
 afterAll(dummyAfterAll);
 beforeEach(dummyBeforeEach);
 afterEach(dummyAfterEach);
+
+ignoreMimallocWarning({ beforeAll, afterAll });
+
+describe("chooses", () => {
+  async function runTest(latest: string, range: string, chosen = "0.0.5") {
+    const exeName: string = {
+      "0.0.5": "baz-exec",
+      "0.0.3": "baz-run",
+    }[chosen]!;
+    if (!exeName) throw new Error("exeName not found");
+
+    const urls: string[] = [];
+    setHandler(
+      dummyRegistry(urls, {
+        "0.0.5": {
+          bin: {
+            "baz-exec": "index.js",
+          },
+        },
+
+        "0.0.3": {
+          bin: {
+            "baz-run": "index.js",
+          },
+        },
+        latest,
+      }),
+    );
+    await writeFile(
+      join(package_dir, "package.json"),
+      JSON.stringify({
+        name: "foo",
+        version: "0.0.1",
+        dependencies: {
+          baz: range,
+        },
+      }),
+    );
+    const { stdout, stderr, exited } = spawn({
+      cmd: [bunExe(), "install"],
+      cwd: package_dir,
+      stdout: null,
+      stdin: "pipe",
+      stderr: "pipe",
+      env,
+    });
+    expect(stderr).toBeDefined();
+    const err = await new Response(stderr).text();
+    expect(err).toContain("Saved lockfile");
+    expect(stdout).toBeDefined();
+    const out = await new Response(stdout).text();
+    expect(out.replace(/\s*\[[0-9\.]+m?s\]\s*$/, "").split(/\r?\n/)).toEqual([
+      ` + baz@${chosen}`,
+      "",
+      " 1 package installed",
+    ]);
+    expect(await exited).toBe(0);
+    expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-${chosen}.tgz`]);
+    expect(requested).toBe(2);
+    expect(await readdirSorted(join(package_dir, "node_modules"))).toEqual([".bin", ".cache", "baz"]);
+    expect(await readdirSorted(join(package_dir, "node_modules", ".bin"))).toEqual([exeName]);
+    expect(await readlink(join(package_dir, "node_modules", ".bin", exeName))).toBe(join("..", "baz", "index.js"));
+    expect(await readdirSorted(join(package_dir, "node_modules", "baz"))).toEqual(["index.js", "package.json"]);
+    expect(await file(join(package_dir, "node_modules", "baz", "package.json")).json()).toEqual({
+      name: "baz",
+      version: chosen,
+      bin: {
+        [exeName]: "index.js",
+      },
+    } as any);
+    await access(join(package_dir, "bun.lockb"));
+  }
+
+  describe("highest matching version", () => {
+    for (let latest of ["999.999.999", "0.0.4", "0.0.2"]) {
+      for (let range of ["0.0.x", "~0.0.4", "~0.0.2"]) {
+        it("when latest is " + latest + " and range is " + range, async () => {
+          await runTest(latest, range);
+        });
+      }
+    }
+  });
+
+  describe('"latest" tag', () => {
+    for (let latest of ["0.0.5", "0.0.3"]) {
+      it(latest, async () => {
+        await runTest(latest, "~0.0.3", latest);
+      });
+    }
+  });
+});
 
 it("should report connection errors", async () => {
   function end(socket: Socket) {
@@ -2577,6 +2668,121 @@ it("should not hoist if name collides with alias", async () => {
   await access(join(package_dir, "bun.lockb"));
 });
 
+it("should get npm alias with matching version", async () => {
+  const urls: string[] = [];
+  setHandler(
+    dummyRegistry(urls, {
+      "0.0.3": { as: "0.0.3" },
+      "0.0.5": { as: "0.0.5" },
+    }),
+  );
+  await writeFile(
+    join(package_dir, "package.json"),
+    JSON.stringify({
+      name: "foo",
+      version: "0.0.1",
+      workspaces: ["moo"],
+      dependencies: {
+        "boba": "npm:baz@0.0.5",
+      },
+    }),
+  );
+  await mkdir(join(package_dir, "moo"));
+  await writeFile(
+    join(package_dir, "moo", "package.json"),
+    JSON.stringify({
+      name: "moo",
+      version: "0.0.2",
+      dependencies: {
+        boba: ">=0.0.3",
+      },
+    }),
+  );
+  const { stdout, stderr, exited } = spawn({
+    cmd: [bunExe(), "install"],
+    cwd: package_dir,
+    stdout: null,
+    stdin: "pipe",
+    stderr: "pipe",
+    env,
+  });
+  expect(stderr).toBeDefined();
+  const err = await new Response(stderr).text();
+  expect(err).toContain("Saved lockfile");
+  expect(stdout).toBeDefined();
+  const out = await new Response(stdout).text();
+  expect(out.replace(/\s*\[[0-9\.]+m?s\]\s*$/, "").split(/\r?\n/)).toEqual([
+    " + moo@workspace:moo",
+    " + boba@0.0.5",
+    "",
+    " 2 packages installed",
+  ]);
+  expect(await exited).toBe(0);
+  expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-0.0.5.tgz`]);
+  expect(requested).toBe(2);
+  expect(await readdirSorted(join(package_dir, "node_modules"))).toEqual([".cache", "boba", "moo"]);
+  expect(await file(join(package_dir, "node_modules", "boba", "package.json")).json()).toEqual({
+    name: "baz",
+    version: "0.0.5",
+    bin: {
+      "baz-exec": "index.js",
+    },
+  });
+  await access(join(package_dir, "bun.lockb"));
+});
+
+it("should not apply overrides to package name of aliased package", async () => {
+  const urls: string[] = [];
+  setHandler(
+    dummyRegistry(urls, {
+      "0.0.3": { as: "0.0.3" },
+    }),
+  );
+  await writeFile(
+    join(package_dir, "package.json"),
+    JSON.stringify({
+      name: "foo",
+      version: "0.2.0",
+      dependencies: {
+        bar: "npm:baz@0.0.3",
+      },
+      overrides: {
+        "baz": "0.0.5",
+      },
+    }),
+  );
+  const { stdout, stderr, exited } = spawn({
+    cmd: [bunExe(), "install"],
+    cwd: package_dir,
+    stdout: null,
+    stdin: "pipe",
+    stderr: "pipe",
+    env,
+  });
+
+  expect(stderr).toBeDefined();
+  const err = await new Response(stderr).text();
+  expect(err).toContain("Saved lockfile");
+  expect(stdout).toBeDefined();
+  const out = await new Response(stdout).text();
+  expect(out.replace(/\s*\[[0-9\.]+m?s\]\s*$/, "").split(/\r?\n/)).toEqual([
+    " + bar@0.0.3",
+    "",
+    " 1 package installed",
+  ]);
+  expect(await exited).toBe(0);
+  expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-0.0.3.tgz`]);
+  expect(requested).toBe(2);
+  expect(await file(join(package_dir, "node_modules", "bar", "package.json")).json()).toEqual({
+    name: "baz",
+    version: "0.0.3",
+    bin: {
+      "baz-run": "index.js",
+    },
+  });
+  await access(join(package_dir, "bun.lockb"));
+});
+
 it("should handle unscoped alias on scoped dependency", async () => {
   const urls: string[] = [];
   setHandler(dummyRegistry(urls, { "0.1.0": {} }));
@@ -3790,14 +3996,14 @@ it("should consider peerDependencies during hoisting", async () => {
   expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-0.0.3.tgz`, `${root_url}/baz-0.0.5.tgz`]);
   expect(requested).toBe(3);
   expect(await readdirSorted(join(package_dir, "node_modules"))).toEqual([".bin", ".cache", "bar", "baz", "moo"]);
-  expect(await readdirSorted(join(package_dir, "node_modules", ".bin"))).toEqual(["baz-exec", "baz-run"]);
+  expect(await readdirSorted(join(package_dir, "node_modules", ".bin"))).toEqual(["baz-exec"]);
   expect(await readlink(join(package_dir, "node_modules", ".bin", "baz-exec"))).toBe(join("..", "baz", "index.js"));
-  expect(await readlink(join(package_dir, "node_modules", ".bin", "baz-run"))).toBe(
-    join("..", "..", "bar", "node_modules", "baz", "index.js"),
-  );
   expect(await readlink(join(package_dir, "node_modules", "bar"))).toBe(join("..", "bar"));
   expect(await readdirSorted(join(package_dir, "bar"))).toEqual(["node_modules", "package.json"]);
-  expect(await readdirSorted(join(package_dir, "bar", "node_modules"))).toEqual(["baz"]);
+  expect(await readdirSorted(join(package_dir, "bar", "node_modules"))).toEqual([".bin", "baz"]);
+  expect(await readlink(join(package_dir, "bar", "node_modules", ".bin", "baz-run"))).toBe(
+    join("..", "baz", "index.js"),
+  );
   expect(await readdirSorted(join(package_dir, "bar", "node_modules", "baz"))).toEqual(["index.js", "package.json"]);
   expect(await file(join(package_dir, "bar", "node_modules", "baz", "package.json")).json()).toEqual({
     name: "baz",
@@ -3891,28 +4097,28 @@ it("should install peerDependencies when needed", async () => {
   expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-0.0.3.tgz`, `${root_url}/baz-0.0.5.tgz`]);
   expect(requested).toBe(3);
   expect(await readdirSorted(join(package_dir, "node_modules"))).toEqual([".bin", ".cache", "bar", "baz", "moo"]);
-  expect(await readdirSorted(join(package_dir, "node_modules", ".bin"))).toEqual(["baz-exec", "baz-run"]);
-  expect(await readlink(join(package_dir, "node_modules", ".bin", "baz-exec"))).toBe(
-    join("..", "..", "moo", "node_modules", "baz", "index.js"),
-  );
-  expect(await readlink(join(package_dir, "node_modules", ".bin", "baz-run"))).toBe(join("..", "baz", "index.js"));
+  expect(await readdirSorted(join(package_dir, "node_modules", ".bin"))).toEqual(["baz-exec"]);
+  expect(await readlink(join(package_dir, "node_modules", ".bin", "baz-exec"))).toBe(join("..", "baz", "index.js"));
   expect(await readlink(join(package_dir, "node_modules", "bar"))).toBe(join("..", "bar"));
-  expect(await readdirSorted(join(package_dir, "bar"))).toEqual(["package.json"]);
+  expect(await readdirSorted(join(package_dir, "bar"))).toEqual(["node_modules", "package.json"]);
+  expect(await readlink(join(package_dir, "bar", "node_modules", ".bin", "baz-run"))).toBe(
+    join("..", "baz", "index.js"),
+  );
   expect(await readdirSorted(join(package_dir, "node_modules", "baz"))).toEqual(["index.js", "package.json"]);
   expect(await file(join(package_dir, "node_modules", "baz", "package.json")).json()).toEqual({
-    name: "baz",
-    version: "0.0.3",
-    bin: {
-      "baz-run": "index.js",
-    },
-  });
-  expect(await readlink(join(package_dir, "node_modules", "moo"))).toBe(join("..", "moo"));
-  expect(await readdirSorted(join(package_dir, "moo"))).toEqual(["node_modules", "package.json"]);
-  expect(await file(join(package_dir, "moo", "node_modules", "baz", "package.json")).json()).toEqual({
     name: "baz",
     version: "0.0.5",
     bin: {
       "baz-exec": "index.js",
+    },
+  });
+  expect(await readlink(join(package_dir, "node_modules", "moo"))).toBe(join("..", "moo"));
+  expect(await readdirSorted(join(package_dir, "moo"))).toEqual(["package.json"]);
+  expect(await file(join(package_dir, "bar", "node_modules", "baz", "package.json")).json()).toEqual({
+    name: "baz",
+    version: "0.0.3",
+    bin: {
+      "baz-run": "index.js",
     },
   });
   await access(join(package_dir, "bun.lockb"));
@@ -3976,17 +4182,7 @@ it("should report error on invalid format for package.json", async () => {
   });
   expect(stderr).toBeDefined();
   const err = await new Response(stderr).text();
-  expect(err.replace(/^bun install v.+\n/, "bun install\n").split(/\r?\n/)).toEqual([
-    "bun install",
-    "",
-    "",
-    "error: Unexpected foo",
-    "foo",
-    "^",
-    `${package_dir}/package.json:1:1 0`,
-    `ParserError parsing package.json in "${package_dir}/"`,
-    "",
-  ]);
+  expect(err.replace(/^bun install v.+\n/, "bun install\n").replaceAll(package_dir, "[dir]")).toMatchSnapshot();
   expect(stdout).toBeDefined();
   const out = await new Response(stdout).text();
   expect(out).toEqual("");
@@ -4012,19 +4208,7 @@ it("should report error on invalid format for dependencies", async () => {
   });
   expect(stderr).toBeDefined();
   const err = await new Response(stderr).text();
-  expect(err.replace(/^bun install v.+\n/, "bun install\n").split(/\r?\n/)).toEqual([
-    "bun install",
-    "",
-    "",
-    "error: dependencies expects a map of specifiers, e.g.",
-    '"dependencies": {',
-    '  "bun": "latest"',
-    "}",
-    '{"name":"foo","version":"0.0.1","dependencies":[]}',
-    "                                ^",
-    `${package_dir}/package.json:1:33 32`,
-    "",
-  ]);
+  expect(err.replace(/^bun install v.+\n/, "bun install\n").replaceAll(package_dir, "[dir]")).toMatchSnapshot();
   expect(stdout).toBeDefined();
   const out = await new Response(stdout).text();
   expect(out).toEqual("");
@@ -4050,19 +4234,7 @@ it("should report error on invalid format for optionalDependencies", async () =>
   });
   expect(stderr).toBeDefined();
   const err = await new Response(stderr).text();
-  expect(err.replace(/^bun install v.+\n/, "bun install\n").split(/\r?\n/)).toEqual([
-    "bun install",
-    "",
-    "",
-    "error: optionalDependencies expects a map of specifiers, e.g.",
-    '"optionalDependencies": {',
-    '  "bun": "latest"',
-    "}",
-    '{"name":"foo","version":"0.0.1","optionalDependencies":"bar"}',
-    "                                ^",
-    `${package_dir}/package.json:1:33 32`,
-    "",
-  ]);
+  expect(err.replace(/^bun install v.+\n/, "bun install\n").replaceAll(package_dir, "[dir]")).toMatchSnapshot();
   expect(stdout).toBeDefined();
   const out = await new Response(stdout).text();
   expect(out).toEqual("");
@@ -4090,19 +4262,7 @@ it("should report error on invalid format for workspaces", async () => {
   });
   expect(stderr).toBeDefined();
   const err = await new Response(stderr).text();
-  expect(err.replace(/^bun install v.+\n/, "bun install\n").split(/\r?\n/)).toEqual([
-    "bun install",
-    "",
-    "",
-    "error: Workspaces expects an array of strings, e.g.",
-    '"workspaces": [',
-    '  "path/to/package"',
-    "]",
-    '{"name":"foo","version":"0.0.1","workspaces":{"packages":{"bar":true}}}',
-    "                                ^",
-    `${package_dir}/package.json:1:33 32`,
-    "",
-  ]);
+  expect(err.replace(/^bun install v.+\n/, "bun install\n").replaceAll(package_dir, "[dir]")).toMatchSnapshot();
   expect(stdout).toBeDefined();
   const out = await new Response(stdout).text();
   expect(out).toEqual("");
@@ -4144,17 +4304,12 @@ it("should report error on duplicated workspace packages", async () => {
   });
   expect(stderr).toBeDefined();
   const err = await new Response(stderr).text();
-  expect(err.replace(/^bun install v.+\n/, "bun install\n").split(/\r?\n/)).toEqual([
-    "bun install",
-    "",
-    "",
-    'error: Workspace name "moo" already exists',
-    '{"name":"foo","version":"0.0.1","workspaces":["bar","baz"]}',
-    // we don't have a name location anymore
-    "^",
-    `${package_dir}/package.json:1:1 0`,
-    "",
-  ]);
+  expect(
+    err
+      .replace(/^bun install v.+\n/, "bun install\n")
+      .replace()
+      .replaceAll(package_dir, "[dir]"),
+  ).toMatchSnapshot();
   expect(stdout).toBeDefined();
   const out = await new Response(stdout).text();
   expect(out).toEqual("");
@@ -5780,7 +5935,7 @@ cache = false
     " + tsd@0.22.0",
     " + typescript@5.0.4",
     "",
-    " 118 packages installed",
+    " 119 packages installed",
   ]);
   expect(await exited1).toBe(0);
   expect(await readdirSorted(package_dir)).toEqual(["bun.lockb", "bunfig.toml", "node_modules", "package.json"]);
@@ -5816,11 +5971,12 @@ cache = false
     "fastq",
     "fill-range",
     "find-up",
+    "function-bind",
     "glob-parent",
     "globby",
     "hard-rejection",
-    "has",
     "has-flag",
+    "hasown",
     "hosted-git-info",
     "ignore",
     "indent-string",
@@ -6557,6 +6713,7 @@ it("should handle installing packages inside workspaces with difference versions
       " + package3@workspace:packages/package3",
       " + package4@workspace:packages/package4",
       " + package5@workspace:packages/package5",
+      " + bar@0.0.2",
       "",
       " 6 packages installed",
     ]);
@@ -6610,6 +6767,7 @@ it("should handle installing packages inside workspaces with difference versions
       " + package3@workspace:packages/package3",
       " + package4@workspace:packages/package4",
       " + package5@workspace:packages/package5",
+      " + bar@0.0.2",
       "",
       " 6 packages installed",
     ]);
@@ -6663,6 +6821,7 @@ it("should handle installing packages inside workspaces with difference versions
       " + package3@workspace:packages/package3",
       " + package4@workspace:packages/package4",
       " + package5@workspace:packages/package5",
+      " + bar@0.0.2",
       "",
       " 6 packages installed",
     ]);
@@ -6717,6 +6876,7 @@ it("should handle installing packages inside workspaces with difference versions
       " + package3@workspace:packages/package3",
       " + package4@workspace:packages/package4",
       " + package5@workspace:packages/package5",
+      " + bar@0.0.2",
       "",
       " 6 packages installed",
     ]);
@@ -7432,6 +7592,51 @@ it("should install peer dependencies from root package", async () => {
   await access(join(package_dir, "bun.lockb"));
 });
 
+it("should install correct version of peer dependency from root package", async () => {
+  const urls: string[] = [];
+  setHandler(
+    dummyRegistry(urls, {
+      "0.0.3": { as: "0.0.3" },
+      "0.0.5": { as: "0.0.5" },
+    }),
+  );
+  await writeFile(
+    join(package_dir, "package.json"),
+    JSON.stringify({
+      name: "foo",
+      dependencies: {
+        baz: "0.0.3",
+      },
+      peerDependencies: {
+        baz: "0.0.5",
+      },
+    }),
+  );
+  const { stdout, stderr, exited } = spawn({
+    cmd: [bunExe(), "install"],
+    cwd: package_dir,
+    env,
+    stdout: null,
+    stdin: "pipe",
+    stderr: "pipe",
+  });
+  expect(stderr).toBeDefined();
+  const err = await new Response(stderr).text();
+  expect(err).toContain("Saved lockfile");
+  expect(stdout).toBeDefined();
+  const out = await new Response(stdout).text();
+  expect(out.replace(/\s*\[[0-9\.]+m?s\]\s*$/, "").split(/\r?\n/)).toEqual([
+    " + baz@0.0.3",
+    "",
+    " 1 package installed",
+  ]);
+  expect(await exited).toBe(0);
+  expect(urls.sort()).toEqual([`${root_url}/baz`, `${root_url}/baz-0.0.3.tgz`]);
+  expect(requested).toBe(2);
+
+  await access(join(package_dir, "bun.lockb"));
+});
+
 describe("Registry URLs", () => {
   // Some of the non failing URLs are invalid, but bun's URL parser ignores
   // the validation error and returns a valid serialized URL anyway.
@@ -7578,4 +7783,27 @@ describe("Registry URLs", () => {
 
     expect(await exited).toBe(0);
   });
+});
+
+it("should handle @scoped name that contains tilde, issue#7045", async () => {
+  await writeFile(
+    join(package_dir, "bunfig.toml"),
+    `
+[install]
+cache = false
+`,
+  );
+  const { stdout, stderr, exited } = spawn({
+    cmd: [bunExe(), "install", "@~39/empty"],
+    cwd: package_dir,
+    stdin: null,
+    stdout: "pipe",
+    stderr: "pipe",
+    env,
+  });
+  expect(stderr).toBeDefined();
+  expect(await new Response(stderr).text()).toContain("Saved lockfile");
+  expect(stdout).toBeDefined();
+  expect(await new Response(stdout).text()).toContain("installed @~39/empty@1.0.0");
+  expect(await exited).toBe(0);
 });

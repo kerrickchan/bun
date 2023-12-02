@@ -61,7 +61,7 @@ describe("fetch() with streaming", () => {
           const { done } = await reader?.read();
           if (done) break;
         }
-        expect(true).toBe("unreachable");
+        expect.unreachable();
       } catch (err: any) {
         if (err.name !== "TimeoutError") throw err;
         expect(err.message).toBe("The operation timed out.");
@@ -107,7 +107,7 @@ describe("fetch() with streaming", () => {
         const promise = res.text(); // start buffering
         res.body?.getReader(); // get a reader
         const result = await promise; // should throw the right error
-        expect(result).toBe("unreachable");
+        expect.unreachable();
       } catch (err: any) {
         if (err.name !== "TypeError") throw err;
         expect(err.message).toBe("ReadableStream is locked");
@@ -154,7 +154,7 @@ describe("fetch() with streaming", () => {
         const promise = res.text(); // start buffering
         body.getReader(); // get a reader
         const result = await promise; // should throw the right error
-        expect(result).toBe("unreachable");
+        expect.unreachable();
       } catch (err: any) {
         if (err.name !== "TypeError") throw err;
         expect(err.message).toBe("ReadableStream is locked");
@@ -213,7 +213,12 @@ describe("fetch() with streaming", () => {
           .listen(0);
 
         const address = server.address() as AddressInfo;
-        const url = `http://${address.address}:${address.port}`;
+        let url;
+        if (address.family == "IPv4") {
+          url = `http://${address.address}:${address.port}`;
+        } else {
+          url = `http://[${address.address}]:${address.port}`;
+        }
         async function getRequestLen(url: string) {
           const response = await fetch(url);
           const hasBody = response.body;

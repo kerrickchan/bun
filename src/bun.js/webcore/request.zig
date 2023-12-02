@@ -1,10 +1,9 @@
 const std = @import("std");
 const Api = @import("../../api/schema.zig").Api;
 const bun = @import("root").bun;
-const RequestContext = @import("../../bun_dev_http_server.zig").RequestContext;
-const MimeType = @import("../../bun_dev_http_server.zig").MimeType;
+const MimeType = bun.http.MimeType;
 const ZigURL = @import("../../url.zig").URL;
-const HTTPClient = @import("root").bun.HTTP;
+const HTTPClient = @import("root").bun.http;
 const NetworkThread = HTTPClient.NetworkThread;
 const AsyncIO = NetworkThread.AsyncIO;
 const JSC = @import("root").bun.JSC;
@@ -50,6 +49,7 @@ const InternalBlob = JSC.WebCore.InternalBlob;
 const BodyMixin = JSC.WebCore.BodyMixin;
 const Body = JSC.WebCore.Body;
 const Blob = JSC.WebCore.Blob;
+const Response = JSC.WebCore.Response;
 
 const body_value_pool_size: u16 = 256;
 pub const BodyValueRef = bun.HiveRef(Body.Value, body_value_pool_size);
@@ -85,6 +85,19 @@ pub const Request = struct {
     pub const getArrayBuffer = RequestMixin.getArrayBuffer;
     pub const getBlob = RequestMixin.getBlob;
     pub const getFormData = RequestMixin.getFormData;
+    pub const getBlobWithoutCallFrame = RequestMixin.getBlobWithoutCallFrame;
+
+    pub export fn Request__getUWSRequest(
+        this: *Request,
+    ) ?*uws.Request {
+        return this.request_context.getRequest();
+    }
+
+    comptime {
+        if (!JSC.is_bindgen) {
+            _ = Request__getUWSRequest;
+        }
+    }
 
     pub fn getContentType(
         this: *Request,
@@ -173,17 +186,6 @@ pub const Request = struct {
         try writer.writeAll("\n");
         try formatter.writeIndent(Writer, writer);
         try writer.writeAll("}");
-    }
-
-    pub fn fromRequestContext(ctx: *RequestContext) !Request {
-        if (comptime Environment.isWindows) unreachable;
-        var req = Request{
-            .url = bun.String.create(ctx.full_url),
-            .body = try InitRequestBodyValue(.{ .Null = {} }),
-            .method = ctx.method,
-            .headers = FetchHeaders.createFromPicoHeaders(ctx.request.headers),
-        };
-        return req;
     }
 
     pub fn mimeType(this: *const Request) string {
@@ -328,7 +330,7 @@ pub const Request = struct {
             const req_url = req.url();
             if (req_url.len > 0 and req_url[0] == '/') {
                 if (req.header("host")) |host| {
-                    const fmt = ZigURL.HostFormatter{
+                    const fmt = strings.HostFormatter{
                         .is_https = this.https,
                         .host = host,
                     };
@@ -355,7 +357,7 @@ pub const Request = struct {
             const req_url = req.url();
             if (req_url.len > 0 and req_url[0] == '/') {
                 if (req.header("host")) |host| {
-                    const fmt = ZigURL.HostFormatter{
+                    const fmt = strings.HostFormatter{
                         .is_https = this.https,
                         .host = host,
                     };
@@ -542,12 +544,12 @@ pub const Request = struct {
 
                 if (value.as(JSC.WebCore.Response)) |response| {
                     if (!fields.contains(.method)) {
-                        req.method = response.body.init.method;
+                        req.method = response.init.method;
                         fields.insert(.method);
                     }
 
                     if (!fields.contains(.headers)) {
-                        if (response.body.init.headers) |headers| {
+                        if (response.init.headers) |headers| {
                             req.headers = headers.cloneThis(globalThis);
                             fields.insert(.headers);
                         }
@@ -623,7 +625,7 @@ pub const Request = struct {
             }
 
             if (!fields.contains(.method) or !fields.contains(.headers)) {
-                if (Body.Init.init(globalThis.allocator(), globalThis, value) catch null) |init| {
+                if (Response.Init.init(globalThis.allocator(), globalThis, value) catch null) |init| {
                     if (!explicit_check or (explicit_check and value.fastGet(globalThis, .method) != null)) {
                         if (!fields.contains(.method)) {
                             req.method = init.method;

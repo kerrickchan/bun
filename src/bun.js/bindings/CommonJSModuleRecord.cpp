@@ -32,26 +32,24 @@
 #include "root.h"
 #include "headers-handwritten.h"
 #include "ZigGlobalObject.h"
-#include "JavaScriptCore/JSSourceCode.h"
-#include "JavaScriptCore/JSString.h"
-#include "JavaScriptCore/JSValueInternal.h"
-#include "JavaScriptCore/JSVirtualMachineInternal.h"
-#include "JavaScriptCore/ObjectConstructor.h"
-#include "JavaScriptCore/OptionsList.h"
-#include "JavaScriptCore/ParserError.h"
-#include "JavaScriptCore/ScriptExecutable.h"
-#include "JavaScriptCore/SourceOrigin.h"
-#include "JavaScriptCore/StackFrame.h"
-#include "JavaScriptCore/StackVisitor.h"
+#include <JavaScriptCore/JSSourceCode.h>
+#include <JavaScriptCore/JSString.h>
+#include <JavaScriptCore/ObjectConstructor.h>
+#include <JavaScriptCore/OptionsList.h>
+#include <JavaScriptCore/ParserError.h>
+#include <JavaScriptCore/ScriptExecutable.h>
+#include <JavaScriptCore/SourceOrigin.h>
+#include <JavaScriptCore/StackFrame.h>
+#include <JavaScriptCore/StackVisitor.h>
 #include "BunClientData.h"
-#include "JavaScriptCore/Identifier.h"
+#include <JavaScriptCore/Identifier.h>
 #include "ImportMetaObject.h"
 
-#include "JavaScriptCore/TypedArrayInlines.h"
-#include "JavaScriptCore/PropertyNameArray.h"
-#include "JavaScriptCore/JSWeakMap.h"
-#include "JavaScriptCore/JSWeakMapInlines.h"
-#include "JavaScriptCore/JSWithScope.h"
+#include <JavaScriptCore/TypedArrayInlines.h>
+#include <JavaScriptCore/PropertyNameArray.h>
+#include <JavaScriptCore/JSWeakMap.h>
+#include <JavaScriptCore/JSWeakMapInlines.h>
+#include <JavaScriptCore/JSWithScope.h>
 
 #include <JavaScriptCore/DFGAbstractHeap.h>
 #include <JavaScriptCore/Completion.h>
@@ -61,11 +59,12 @@
 #include <JavaScriptCore/JSMapInlines.h>
 #include <JavaScriptCore/GetterSetter.h>
 #include "ZigSourceProvider.h"
-#include "JavaScriptCore/FunctionPrototype.h"
+#include <JavaScriptCore/FunctionPrototype.h>
 #include "CommonJSModuleRecord.h"
 #include <JavaScriptCore/JSModuleNamespaceObject.h>
 #include <JavaScriptCore/JSSourceCode.h>
 #include <JavaScriptCore/LazyPropertyInlines.h>
+#include <JavaScriptCore/HeapAnalyzer.h>
 
 extern "C" bool Bun__isBunMain(JSC::JSGlobalObject* global, const char* input_ptr, uint64_t input_len);
 
@@ -93,37 +92,53 @@ static bool canPerformFastEnumeration(Structure* s)
 
 static bool evaluateCommonJSModuleOnce(JSC::VM& vm, Zig::GlobalObject* globalObject, JSCommonJSModule* moduleObject, JSString* dirname, JSValue filename, WTF::NakedPtr<Exception>& exception)
 {
-    JSC::Structure* thisObjectStructure = globalObject->commonJSFunctionArgumentsStructure();
+    JSSourceCode* code = moduleObject->sourceCode.get();
+
+    // If an exception occurred somewhere else, we might have cleared the source code.
+    if (UNLIKELY(code == nullptr)) {
+        auto throwScope = DECLARE_THROW_SCOPE(vm);
+        throwException(globalObject, throwScope, createError(globalObject, "Failed to evaluate module"_s));
+        exception = throwScope.exception();
+        return false;
+    }
 
     JSFunction* resolveFunction = JSC::JSBoundFunction::create(vm,
         globalObject,
         globalObject->requireResolveFunctionUnbound(),
         moduleObject->id(),
-        ArgList(), 1, jsString(vm, String("resolve"_s)));
+        ArgList(), 1, globalObject->commonStrings().resolveString(globalObject));
     JSFunction* requireFunction = JSC::JSBoundFunction::create(vm,
         globalObject,
         globalObject->requireFunctionUnbound(),
         moduleObject,
-        ArgList(), 1, jsString(vm, String("require"_s)));
+        ArgList(), 1, globalObject->commonStrings().requireString(globalObject));
     requireFunction->putDirect(vm, vm.propertyNames->resolve, resolveFunction, 0);
     moduleObject->putDirect(vm, WebCore::clientData(vm)->builtinNames().requirePublicName(), requireFunction, 0);
 
-    JSC::JSObject* thisObject = JSC::constructEmptyObject(vm, thisObjectStructure);
-    thisObject->putDirectOffset(vm, 0, moduleObject);
-    thisObject->putDirectOffset(vm, 1, requireFunction);
-    thisObject->putDirectOffset(vm, 2, resolveFunction);
-    thisObject->putDirectOffset(vm, 3, dirname);
-    thisObject->putDirectOffset(vm, 4, filename);
-
     moduleObject->hasEvaluated = true;
-    // TODO: try to not use this write barrier. it needs some extensive testing.
-    // there is some possible GC issue where `thisObject` is gc'd before it should be
-    globalObject->m_BunCommonJSModuleValue.set(vm, globalObject, thisObject);
 
-    JSValue empty = JSC::evaluate(globalObject, moduleObject->sourceCode.get()->sourceCode(), thisObject, exception);
+    JSFunction* fn = jsCast<JSC::JSFunction*>(JSC::evaluate(globalObject, code->sourceCode(), jsUndefined(), exception));
 
-    ensureStillAliveHere(thisObject);
-    globalObject->m_BunCommonJSModuleValue.clear();
+    if (exception.get()) {
+        moduleObject->sourceCode.clear();
+        return false;
+    }
+
+    JSC::CallData callData = JSC::getCallData(fn);
+    MarkedArgumentBuffer args;
+    args.append(moduleObject->exportsObject()); // exports
+    args.append(requireFunction); // require
+    args.append(moduleObject); // module
+    args.append(filename); // filename
+    args.append(dirname); // dirname
+
+    if (fn->jsExecutable()->parameterCount() > 5) {
+        // it expects ImportMetaObject
+        args.append(Zig::ImportMetaObject::create(globalObject, filename));
+    }
+
+    JSC::call(globalObject, fn, callData, moduleObject, args, exception);
+
     moduleObject->sourceCode.clear();
 
     return exception.get() == nullptr;
@@ -196,11 +211,25 @@ static const HashTableValue RequireFunctionPrototypeValues[] = {
     { "cache"_s, static_cast<unsigned>(JSC::PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, jsRequireCacheGetter, jsRequireCacheSetter } },
 };
 
+Structure* RequireFunctionPrototype::createStructure(
+    JSC::VM& vm,
+    JSC::JSGlobalObject* globalObject)
+{
+    return Structure::create(vm, globalObject, globalObject->functionPrototype(), TypeInfo(ObjectType, StructureFlags), info());
+}
+
+Structure* RequireResolveFunctionPrototype::createStructure(
+    JSC::VM& vm,
+    JSC::JSGlobalObject* globalObject)
+{
+    return Structure::create(vm, globalObject, globalObject->functionPrototype(), TypeInfo(ObjectType, StructureFlags), info());
+}
+
 RequireResolveFunctionPrototype* RequireResolveFunctionPrototype::create(JSC::JSGlobalObject* globalObject)
 {
     auto& vm = globalObject->vm();
 
-    auto* structure = RequireResolveFunctionPrototype::createStructure(vm, globalObject, globalObject->functionPrototype());
+    auto* structure = RequireResolveFunctionPrototype::createStructure(vm, globalObject);
     RequireResolveFunctionPrototype* prototype = new (NotNull, JSC::allocateCell<RequireResolveFunctionPrototype>(vm)) RequireResolveFunctionPrototype(vm, structure);
     prototype->finishCreation(vm);
     return prototype;
@@ -211,11 +240,11 @@ RequireFunctionPrototype* RequireFunctionPrototype::create(
 {
     auto& vm = globalObject->vm();
 
-    auto* structure = RequireFunctionPrototype::createStructure(vm, globalObject, globalObject->functionPrototype());
+    auto* structure = RequireFunctionPrototype::createStructure(vm, globalObject);
     RequireFunctionPrototype* prototype = new (NotNull, JSC::allocateCell<RequireFunctionPrototype>(vm)) RequireFunctionPrototype(vm, structure);
     prototype->finishCreation(vm);
 
-    prototype->putDirect(vm, JSC::Identifier::fromString(vm, "resolve"_s), static_cast<Zig::GlobalObject*>(globalObject)->requireResolveFunctionUnbound(), PropertyAttribute::Function | 0);
+    prototype->putDirect(vm, builtinNames(vm).resolvePublicName(), jsCast<Zig::GlobalObject*>(globalObject)->requireResolveFunctionUnbound(), 0);
 
     return prototype;
 }
@@ -223,7 +252,7 @@ RequireFunctionPrototype* RequireFunctionPrototype::create(
 void RequireFunctionPrototype::finishCreation(JSC::VM& vm)
 {
     Base::finishCreation(vm);
-    ASSERT(inherits(vm, info()));
+    ASSERT(inherits(info()));
 
     reifyStaticProperties(vm, info(), RequireFunctionPrototypeValues, *this);
     JSC::JSFunction* requireDotMainFunction = JSFunction::create(
@@ -231,11 +260,11 @@ void RequireFunctionPrototype::finishCreation(JSC::VM& vm)
         moduleMainCodeGenerator(vm),
         globalObject()->globalScope());
 
-    this->putDirect(
-        vm,
+    this->putDirectAccessor(
+        globalObject(),
         JSC::Identifier::fromString(vm, "main"_s),
-        JSC::GetterSetter::create(vm, globalObject(), requireDotMainFunction, JSValue()),
-        PropertyAttribute::Builtin | PropertyAttribute::Accessor | PropertyAttribute::ReadOnly | 0);
+        JSC::GetterSetter::create(vm, globalObject(), requireDotMainFunction, requireDotMainFunction),
+        PropertyAttribute::Accessor | PropertyAttribute::ReadOnly | 0);
 
     auto extensions = constructEmptyObject(globalObject());
     extensions->putDirect(vm, JSC::Identifier::fromString(vm, ".js"_s), jsBoolean(true), 0);
@@ -308,7 +337,7 @@ JSC_DEFINE_CUSTOM_SETTER(setterPath,
     return true;
 }
 
-extern "C" EncodedJSValue Resolver__propForRequireMainPaths(JSGlobalObject*);
+extern "C" JSC::EncodedJSValue Resolver__propForRequireMainPaths(JSGlobalObject*);
 
 JSC_DEFINE_CUSTOM_GETTER(getterPaths, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
 {
@@ -323,6 +352,16 @@ JSC_DEFINE_CUSTOM_GETTER(getterPaths, (JSC::JSGlobalObject * globalObject, JSC::
     }
 
     return JSValue::encode(thisObject->m_paths.get());
+}
+
+JSC_DEFINE_CUSTOM_GETTER(getterLoaded, (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue, JSC::PropertyName))
+{
+    JSCommonJSModule* thisObject = jsDynamicCast<JSCommonJSModule*>(JSValue::decode(thisValue));
+    if (UNLIKELY(!thisObject)) {
+        return JSValue::encode(jsUndefined());
+    }
+
+    return JSValue::encode(jsBoolean(thisObject->hasEvaluated));
 }
 
 JSC_DEFINE_CUSTOM_SETTER(setterPaths,
@@ -372,12 +411,19 @@ JSC_DEFINE_CUSTOM_SETTER(setterParent,
 
     return true;
 }
-
-static JSValue createLoaded(VM& vm, JSObject* object)
+JSC_DEFINE_CUSTOM_SETTER(setterLoaded,
+    (JSC::JSGlobalObject * globalObject, JSC::EncodedJSValue thisValue,
+        JSC::EncodedJSValue value, JSC::PropertyName propertyName))
 {
-    JSCommonJSModule* cjs = jsCast<JSCommonJSModule*>(object);
-    return jsBoolean(cjs->hasEvaluated);
+    JSCommonJSModule* thisObject = jsDynamicCast<JSCommonJSModule*>(JSValue::decode(thisValue));
+    if (!thisObject)
+        return false;
+
+    thisObject->hasEvaluated = JSValue::decode(value).toBoolean(globalObject);
+
+    return true;
 }
+
 static JSValue createChildren(VM& vm, JSObject* object)
 {
     return constructEmptyArray(object->globalObject(), nullptr, 0);
@@ -402,7 +448,7 @@ JSC_DEFINE_HOST_FUNCTION(functionCommonJSModuleRecord_compile, (JSGlobalObject *
     String wrappedString = makeString(
         "(function(exports,require,module,__filename,__dirname){"_s,
         sourceString,
-        "\n}).call(this.module.exports,this.module.exports,this.require,this.module,this.__filename,this.__dirname)"_s);
+        "\n})"_s);
 
     SourceCode sourceCode = makeSource(
         WTFMove(wrappedString),
@@ -445,7 +491,7 @@ static const struct HashTableValue JSCommonJSModulePrototypeTableValues[] = {
     { "children"_s, static_cast<unsigned>(PropertyAttribute::PropertyCallback), NoIntrinsic, { HashTableValue::LazyPropertyType, createChildren } },
     { "filename"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, getterFilename, setterFilename } },
     { "id"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, getterId, setterId } },
-    { "loaded"_s, static_cast<unsigned>(PropertyAttribute::PropertyCallback), NoIntrinsic, { HashTableValue::LazyPropertyType, createLoaded } },
+    { "loaded"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, getterLoaded, setterLoaded } },
     { "parent"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor | PropertyAttribute::DontEnum), NoIntrinsic, { HashTableValue::GetterSetterType, getterParent, setterParent } },
     { "path"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, getterPath, setterPath } },
     { "paths"_s, static_cast<unsigned>(PropertyAttribute::CustomAccessor), NoIntrinsic, { HashTableValue::GetterSetterType, getterPaths, setterPaths } },
@@ -464,6 +510,14 @@ public:
         return prototype;
     }
 
+    static JSC::Structure* createStructure(
+        JSC::VM& vm,
+        JSC::JSGlobalObject* globalObject,
+        JSC::JSValue prototype)
+    {
+        return JSC::Structure::create(vm, globalObject, prototype, TypeInfo(JSC::ObjectType, StructureFlags), info());
+    }
+
     DECLARE_INFO;
 
     JSCommonJSModulePrototype(
@@ -476,14 +530,15 @@ public:
     template<typename CellType, JSC::SubspaceAccess>
     static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
     {
+        STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSCommonJSModulePrototype, Base);
         return &vm.plainObjectSpace();
     }
 
     void finishCreation(JSC::VM& vm, JSC::JSGlobalObject* globalObject)
     {
         Base::finishCreation(vm);
-        ASSERT(inherits(vm, info()));
-        reifyStaticProperties(vm, JSCommonJSModule::info(), JSCommonJSModulePrototypeTableValues, *this);
+        ASSERT(inherits(info()));
+        reifyStaticProperties(vm, info(), JSCommonJSModulePrototypeTableValues, *this);
 
         this->putDirectNativeFunction(
             vm,
@@ -494,16 +549,17 @@ public:
     }
 };
 
-const JSC::ClassInfo JSCommonJSModulePrototype::s_info = { "Module"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSCommonJSModulePrototype) };
+const JSC::ClassInfo JSCommonJSModulePrototype::s_info = { "ModulePrototype"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSCommonJSModulePrototype) };
 
 void JSCommonJSModule::finishCreation(JSC::VM& vm, JSC::JSString* id, JSValue filename, JSC::JSString* dirname, JSC::JSSourceCode* sourceCode)
 {
     Base::finishCreation(vm);
-    ASSERT(inherits(vm, info()));
+    ASSERT(inherits(info()));
     m_id.set(vm, this, id);
     m_filename.set(vm, this, filename);
     m_dirname.set(vm, this, dirname);
-    this->sourceCode.set(vm, this, sourceCode);
+    if (sourceCode)
+        this->sourceCode.set(vm, this, sourceCode);
 }
 
 JSC::Structure* JSCommonJSModule::createStructure(
@@ -569,7 +625,7 @@ JSCommonJSModule* JSCommonJSModule::create(
         vm,
         WebCore::clientData(vm)->builtinNames().exportsPublicName(),
         exportsObject,
-        exportsObject.isCallable() ? JSC::PropertyAttribute::Function | 0 : 0);
+        0);
     out->hasEvaluated = hasEvaluated;
     out->m_parent.set(vm, out, parent);
 
@@ -604,14 +660,15 @@ bool JSCommonJSModule::evaluate(
     RELEASE_AND_RETURN(throwScope, true);
 }
 
-void JSCommonJSModule::toSyntheticSource(JSC::JSGlobalObject* globalObject,
-    JSC::Identifier moduleKey,
+void populateESMExports(
+    JSC::JSGlobalObject* globalObject,
+    JSValue result,
     Vector<JSC::Identifier, 4>& exportNames,
-    JSC::MarkedArgumentBuffer& exportValues)
+    JSC::MarkedArgumentBuffer& exportValues,
+    bool ignoreESModuleAnnotation)
 {
-    auto result = this->exportsObject();
-
     auto& vm = globalObject->vm();
+    Identifier esModuleMarker = builtinNames(vm).__esModulePublicName();
 
     // Bun's intepretation of the "__esModule" annotation:
     //
@@ -644,7 +701,8 @@ void JSCommonJSModule::toSyntheticSource(JSC::JSGlobalObject* globalObject,
     bool needsToAssignDefault = true;
 
     if (result.isObject()) {
-        auto* exports = asObject(result);
+        auto* exports = result.getObject();
+        bool hasESModuleMarker = !ignoreESModuleAnnotation && exports->hasProperty(globalObject, esModuleMarker);
 
         auto* structure = exports->structure();
         uint32_t size = structure->inlineSize() + structure->outOfLineSize();
@@ -653,8 +711,6 @@ void JSCommonJSModule::toSyntheticSource(JSC::JSGlobalObject* globalObject,
 
         auto catchScope = DECLARE_CATCH_SCOPE(vm);
 
-        Identifier esModuleMarker = builtinNames(vm).__esModulePublicName();
-        bool hasESModuleMarker = !this->ignoreESModuleAnnotation && exports->hasProperty(globalObject, esModuleMarker);
         if (catchScope.exception()) {
             catchScope.clearException();
         }
@@ -764,6 +820,17 @@ void JSCommonJSModule::toSyntheticSource(JSC::JSGlobalObject* globalObject,
     }
 }
 
+void JSCommonJSModule::toSyntheticSource(JSC::JSGlobalObject* globalObject,
+    JSC::Identifier moduleKey,
+    Vector<JSC::Identifier, 4>& exportNames,
+    JSC::MarkedArgumentBuffer& exportValues)
+{
+    auto result = this->exportsObject();
+
+    auto& vm = globalObject->vm();
+    populateESMExports(globalObject, result, exportNames, exportValues, this->ignoreESModuleAnnotation);
+}
+
 JSValue JSCommonJSModule::exportsObject()
 {
     return this->get(globalObject(), JSC::PropertyName(clientData(vm())->builtinNames().exportsPublicName()));
@@ -772,18 +839,6 @@ JSValue JSCommonJSModule::exportsObject()
 JSValue JSCommonJSModule::id()
 {
     return m_id.get();
-}
-
-template<typename, SubspaceAccess mode> JSC::GCClient::IsoSubspace* JSCommonJSModule::subspaceFor(JSC::VM& vm)
-{
-    if constexpr (mode == JSC::SubspaceAccess::Concurrently)
-        return nullptr;
-    return WebCore::subspaceForImpl<JSCommonJSModule, WebCore::UseCustomHeapCellType::No>(
-        vm,
-        [](auto& spaces) { return spaces.m_clientSubspaceForCommonJSModuleRecord.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForCommonJSModuleRecord = std::forward<decltype(space)>(space); },
-        [](auto& spaces) { return spaces.m_subspaceForCommonJSModuleRecord.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_subspaceForCommonJSModuleRecord = std::forward<decltype(space)>(space); });
 }
 
 Structure* createCommonJSModuleStructure(
@@ -806,6 +861,20 @@ void JSCommonJSModule::visitChildrenImpl(JSCell* cell, Visitor& visitor)
 }
 
 DEFINE_VISIT_CHILDREN(JSCommonJSModule);
+
+void JSCommonJSModule::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
+{
+    auto* thisObject = jsCast<JSCommonJSModule*>(cell);
+
+    if (auto* id = thisObject->m_id.get()) {
+        if (!id->isRope()) {
+            auto label = id->tryGetValue(false);
+            analyzer.setLabelForCell(cell, label);
+        }
+    }
+    Base::analyzeHeap(cell, analyzer);
+}
+
 const JSC::ClassInfo JSCommonJSModule::s_info = { "Module"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSCommonJSModule) };
 const JSC::ClassInfo RequireResolveFunctionPrototype::s_info = { "resolve"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(RequireResolveFunctionPrototype) };
 const JSC::ClassInfo RequireFunctionPrototype::s_info = { "require"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(RequireFunctionPrototype) };
@@ -849,9 +918,9 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionRequireCommonJS, (JSGlobalObject * lexicalGlo
 void RequireResolveFunctionPrototype::finishCreation(JSC::VM& vm)
 {
     Base::finishCreation(vm);
-    ASSERT(inherits(vm, info()));
+    ASSERT(inherits(info()));
 
-    reifyStaticProperties(vm, RequireResolveFunctionPrototype::info(), RequireResolveFunctionPrototypeValues, *this);
+    reifyStaticProperties(vm, info(), RequireResolveFunctionPrototypeValues, *this);
     JSC_TO_STRING_TAG_WITHOUT_TRANSITION();
 }
 
@@ -897,7 +966,7 @@ std::optional<JSC::SourceCode> createCommonJSModule(
     bool isBuiltIn)
 {
     JSCommonJSModule* moduleObject;
-    WTF::String sourceURL = toStringCopy(source.source_url);
+    WTF::String sourceURL = source.source_url.toWTFString();
 
     JSValue specifierValue = Bun::toJS(globalObject, source.specifier);
     JSValue entry = globalObject->requireMap()->get(globalObject, specifierValue);
@@ -920,13 +989,10 @@ std::optional<JSC::SourceCode> createCommonJSModule(
             dirname = JSC::jsSubstring(globalObject, requireMapKey, 0, index);
         }
 
-        JSC::SourceCode rawInputSource(
-            WTFMove(sourceProvider));
-
         moduleObject = JSCommonJSModule::create(
             vm,
             globalObject->CommonJSModuleObjectStructure(),
-            requireMapKey, filename, dirname, JSC::JSSourceCode::create(vm, WTFMove(rawInputSource)));
+            requireMapKey, filename, dirname, JSC::JSSourceCode::create(vm, SourceCode(WTFMove(sourceProvider))));
 
         moduleObject->putDirect(vm,
             WebCore::clientData(vm)->builtinNames().exportsPublicName(),
@@ -995,21 +1061,19 @@ JSObject* JSCommonJSModule::createBoundRequireFunction(VM& vm, JSGlobalObject* l
         globalObject->CommonJSModuleObjectStructure(),
         filename, filename, dirname, nullptr);
 
-    auto& builtinNames = WebCore::builtinNames(vm);
-
     JSFunction* requireFunction = JSC::JSBoundFunction::create(vm,
         globalObject,
         globalObject->requireFunctionUnbound(),
         moduleObject,
-        ArgList(), 1, jsString(vm, String("require"_s)));
+        ArgList(), 1, globalObject->commonStrings().requireString(globalObject));
 
     JSFunction* resolveFunction = JSC::JSBoundFunction::create(vm,
         globalObject,
         globalObject->requireResolveFunctionUnbound(),
         moduleObject,
-        ArgList(), 1, jsString(vm, String("resolve"_s)));
+        ArgList(), 1, globalObject->commonStrings().resolveString(globalObject));
 
-    requireFunction->putDirect(vm, builtinNames.resolvePublicName(), resolveFunction, PropertyAttribute::Function | 0);
+    requireFunction->putDirect(vm, vm.propertyNames->resolve, resolveFunction, 0);
 
     return requireFunction;
 }

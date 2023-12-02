@@ -340,6 +340,14 @@ export default {
       description: `Bun implements the Node-API spec for building native addons.`,
     }), // "`Node-API`"),
 
+    page("api/glob", "Glob", {
+      description: `Bun includes a fast native Glob implementation for matching file paths.`,
+    }), // "`Glob`"),
+
+    page("api/semver", "Semver", {
+      description: `Bun's native Semver implementation is 20x faster than the popular \`node-semver\` package.`,
+    }), // "`Semver`"),
+
     // divider("Dev Server"),
     // page("bun-dev", "Vanilla"),
     // page("dev/css", "CSS"),
@@ -355,7 +363,7 @@ export default {
     page("project/benchmarking", "Benchmarking", {
       description: `Bun is designed for performance. Learn how to benchmark Bun yourself.`,
     }),
-    page("project/development", "Development", {
+    page("project/contributing", "Contributing", {
       description: "Learn how to contribute to Bun and get your local development environment up and running.",
     }),
     page("project/licensing", "License", {

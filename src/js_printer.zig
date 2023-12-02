@@ -343,7 +343,7 @@ pub fn writeJSONString(input: []const u8, comptime Writer: type, writer: Writer,
             const remain = text[@as(usize, width)..];
             if (encoding != .utf8 and width > 0) {
                 var codepoint_bytes: [4]u8 = undefined;
-                std.mem.writeIntNative(i32, &codepoint_bytes, c);
+                std.mem.writeInt(i32, &codepoint_bytes, c, .little);
                 try writer.writeAll(
                     codepoint_bytes[0..strings.encodeWTF8Rune(codepoint_bytes[0..4], c)],
                 );
@@ -493,6 +493,8 @@ pub const Options = struct {
     source_map_handler: ?SourceMapHandler = null,
     source_map_builder: ?*bun.sourcemap.Chunk.Builder = null,
     css_import_behavior: Api.CssInJsBehavior = Api.CssInJsBehavior.facade,
+
+    runtime_transpiler_cache: ?*bun.JSC.RuntimeTranspilerCache = null,
 
     commonjs_named_exports: js_ast.Ast.CommonJSNamedExports = .{},
     commonjs_named_exports_deoptimized: bool = false,
@@ -981,6 +983,7 @@ fn NewPrinter(
                     p.print("void 0");
                 }
             } else {
+                p.printSpaceBeforeIdentifier();
                 p.addSourceMapping(loc);
                 p.print("undefined");
             }
@@ -1216,7 +1219,7 @@ fn NewPrinter(
         pub fn printClauseAlias(p: *Printer, alias: string) void {
             std.debug.assert(alias.len > 0);
 
-            if (!strings.containsNonBmpCodePoint(alias)) {
+            if (!strings.containsNonBmpCodePointOrIsInvalidIdentifier(alias)) {
                 p.printSpaceBeforeIdentifier();
                 p.printIdentifier(alias);
             } else {
@@ -1723,13 +1726,32 @@ fn NewPrinter(
                 //      const foo = await Promise.resolve(globalThis.Bun)
                 //      const bar = globalThis.Bun
                 //
-                if (record.tag == .bun) {
-                    if (record.kind == .dynamic) {
-                        p.print("Promise.resolve(globalThis.Bun)");
-                    } else if (record.kind == .require) {
-                        p.print("globalThis.Bun");
-                    }
-                    return;
+                switch (record.tag) {
+                    .bun => {
+                        if (record.kind == .dynamic) {
+                            p.print("Promise.resolve(globalThis.Bun)");
+                        } else if (record.kind == .require) {
+                            p.print("globalThis.Bun");
+                        }
+                        return;
+                    },
+                    .bun_test => {
+                        if (record.kind == .dynamic) {
+                            if (p.options.module_type == .cjs) {
+                                p.print("Promise.resolve(globalThis.Bun.jest(__filename))");
+                            } else {
+                                p.print("Promise.resolve(globalThis.Bun.jest(import.meta.path))");
+                            }
+                        } else if (record.kind == .require) {
+                            if (p.options.module_type == .cjs) {
+                                p.print("globalThis.Bun.jest(__filename)");
+                            } else {
+                                p.print("globalThis.Bun.jest(import.meta.path)");
+                            }
+                        }
+                        return;
+                    },
+                    else => {},
                 }
             }
 
@@ -4600,12 +4622,9 @@ fn NewPrinter(
                     if (comptime is_json)
                         unreachable;
 
-                    const c = bestQuoteCharForString(u16, s.value, false);
                     p.printIndent();
                     p.printSpaceBeforeIdentifier();
-                    p.print(c);
-                    p.printQuotedUTF16(s.value, c);
-                    p.print(c);
+                    p.printQuotedUTF8(s.value, false);
                     p.printSemicolonAfterStatement();
                 },
                 .s_break => |s| {
@@ -5773,7 +5792,20 @@ pub fn printAst(
         }
     }
 
-    if (comptime generate_source_map) {
+    if (comptime FeatureFlags.runtime_transpiler_cache and generate_source_map) {
+        if (opts.source_map_handler) |handler| {
+            const source_maps_chunk = printer.source_map_builder.generateChunk(printer.writer.ctx.getWritten());
+            if (opts.runtime_transpiler_cache) |cache| {
+                cache.put(printer.writer.ctx.getWritten(), source_maps_chunk.buffer.list.items);
+            }
+
+            try handler.onSourceMapChunk(source_maps_chunk, source.*);
+        } else {
+            if (opts.runtime_transpiler_cache) |cache| {
+                cache.put(printer.writer.ctx.getWritten(), "");
+            }
+        }
+    } else if (comptime generate_source_map) {
         if (opts.source_map_handler) |handler| {
             try handler.onSourceMapChunk(printer.source_map_builder.generateChunk(printer.writer.ctx.getWritten()), source.*);
         }
