@@ -14,7 +14,7 @@ const StoredFileDescriptorType = bun.StoredFileDescriptorType;
 const ErrorableString = bun.JSC.ErrorableString;
 const Arena = @import("../mimalloc_arena.zig").Arena;
 const C = bun.C;
-const NetworkThread = @import("root").bun.http.NetworkThread;
+
 const IO = @import("root").bun.AsyncIO;
 const Allocator = std.mem.Allocator;
 const IdentityContext = @import("../identity_context.zig").IdentityContext;
@@ -1231,7 +1231,7 @@ pub const VirtualMachine = struct {
 
     pub const Options = struct {
         allocator: std.mem.Allocator,
-        args: Api.TransformOptions = std.mem.zeroes(Api.TransformOptions),
+        args: Api.TransformOptions,
         log: ?*logger.Log = null,
         env_loader: ?*DotEnv.Loader = null,
         store_fd: bool = false,
